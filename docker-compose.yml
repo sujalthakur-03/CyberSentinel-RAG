@@ -1,0 +1,327 @@
+version: "3.8"
+
+services:
+  # ================================
+  # CyberSentinel Queue Coordinator
+  # (Zookeeper)
+  # ================================
+  cybersentinel-queue-coordinator:
+    image: confluentinc/cp-zookeeper:7.3.0
+    container_name: cybersentinel-queue-coordinator
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    volumes:
+      - cybersentinel-zookeeper-data:/var/lib/zookeeper/data
+      - cybersentinel-zookeeper-logs:/var/lib/zookeeper/log
+    networks:
+      - cybersentinel-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 512M
+        reservations:
+          cpus: "0.5"
+          memory: 256M
+
+  # ================================
+  # CyberSentinel Endpoint Processor
+  # (Kafka)
+  # ================================
+  cybersentinel-endpoint-processor:
+    image: confluentinc/cp-kafka:7.3.0
+    container_name: cybersentinel-endpoint-processor
+    depends_on:
+      cybersentinel-queue-coordinator:
+        condition: service_healthy
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: cybersentinel-queue-coordinator:2181
+      KAFKA_ADVERTISED_LISTENERS: >
+        PLAINTEXT://cybersentinel-endpoint-processor:9092,
+        PLAINTEXT_HOST://192.168.1.70:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+
+      # ========== RETENTION POLICIES ==========
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_LOG_RETENTION_BYTES: 107374182400
+      KAFKA_LOG_SEGMENT_BYTES: 1073741824
+      KAFKA_LOG_CLEANUP_POLICY: delete
+      KAFKA_LOG_SEGMENT_DELETE_DELAY_MS: 60000
+      KAFKA_MIN_INSYNC_REPLICAS: 1
+
+      # ========== COMPRESSION ==========
+      KAFKA_COMPRESSION_TYPE: lz4
+
+      # Performance tuning
+      KAFKA_NUM_NETWORK_THREADS: 8
+      KAFKA_NUM_IO_THREADS: 8
+      KAFKA_SOCKET_SEND_BUFFER_BYTES: 102400
+      KAFKA_SOCKET_RECEIVE_BUFFER_BYTES: 102400
+      KAFKA_SOCKET_REQUEST_MAX_BYTES: 104857600
+
+      # JVM
+      KAFKA_HEAP_OPTS: "-Xmx1G -Xms1G"
+
+    volumes:
+      - cybersentinel-kafka-data:/var/lib/kafka/data
+      - cybersentinel-kafka-logs:/var/log/kafka
+    networks:
+      - cybersentinel-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: 4G
+        reservations:
+          cpus: "2"
+          memory: 2G
+
+  # ================================
+  # CyberSentinel Database
+  # (OpenSearch)
+  # ================================
+  cybersentinel-database:
+    image: opensearchproject/opensearch:latest
+    container_name: cybersentinel-database
+    environment:
+      discovery.type: single-node
+      bootstrap.memory_lock: "true"
+      OPENSEARCH_JAVA_OPTS: "-Xms2g -Xmx2g"
+      DISABLE_SECURITY_PLUGIN: "true"
+      path.repo: /usr/share/opensearch/snapshots
+
+      # Performance tuning
+      indices.memory.index_buffer_size: 30%
+      indices.queries.cache.size: 10%
+      indices.fielddata.cache.size: 20%
+
+      # Thread pools
+      thread_pool.write.queue_size: 1000
+      thread_pool.search.queue_size: 1000
+
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - cybersentinel-db-data:/usr/share/opensearch/data
+      - /opt/opensearch-snapshots:/usr/share/opensearch/snapshots
+    ports:
+      - "9200:9200"
+      - "9300:9300"
+    networks:
+      - cybersentinel-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: 8G
+        reservations:
+          cpus: "2"
+          memory: 4G
+
+  # ================================
+  # OpenSearch Dashboards
+  # ================================
+  cybersentinel-database-dashboard:
+    image: opensearchproject/opensearch-dashboards:latest
+    container_name: cybersentinel-database-dashboard
+    depends_on:
+      cybersentinel-database:
+        condition: service_healthy
+    ports:
+      - "5601:5601"
+    environment:
+      OPENSEARCH_HOSTS: '["http://cybersentinel-database:9200"]'
+      DISABLE_SECURITY_DASHBOARDS_PLUGIN: "true"
+    networks:
+      - cybersentinel-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:5601/api/status || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 2G
+        reservations:
+          cpus: "1"
+          memory: 1G
+
+  # ================================
+  # CyberSentinel Secret Vault
+  # ================================
+  cybersentinel-secret-vault:
+    image: hashicorp/vault:1.12.3
+    container_name: cybersentinel-secret-vault
+    command: server -dev
+    cap_add:
+      - IPC_LOCK
+    ports:
+      - "8200:8200"
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: cybersentinel-vault-token
+      VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+    volumes:
+      - cybersentinel-vault-data:/vault/file
+      - cybersentinel-vault-logs:/vault/logs
+    networks:
+      - cybersentinel-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "vault", "status"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 512M
+        reservations:
+          cpus: "0.5"
+          memory: 256M
+
+  # ================================
+  # CyberSentinel RAG Service
+  # ================================
+  cybersentinel-rag:
+    build:
+      context: ./rag-service
+      dockerfile: Dockerfile
+    container_name: cybersentinel-rag
+    depends_on:
+      cybersentinel-database:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    environment:
+      OPENSEARCH_HOST: cybersentinel-database
+      OPENSEARCH_PORT: "9200"
+      OLLAMA_BASE_URL: "http://164.52.194.98:11434"
+      OLLAMA_MODEL: "vicuna:13b"
+    networks:
+      - cybersentinel-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c 'import urllib.request; urllib.request.urlopen(\"http://localhost:8000/health\")' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 2G
+        reservations:
+          cpus: "1"
+          memory: 1G
+
+  # ================================
+  # CyberSentinel UBA Bridge
+  # (Anomaly Detection → RAG Pipeline)
+  # ================================
+  cybersentinel-uba-bridge:
+    build:
+      context: ./uba-bridge
+      dockerfile: Dockerfile
+    container_name: cybersentinel-uba-bridge
+    depends_on:
+      cybersentinel-database:
+        condition: service_healthy
+      cybersentinel-rag:
+        condition: service_healthy
+    ports:
+      - "8002:8001"
+    environment:
+      OPENSEARCH_HOST: cybersentinel-database
+      OPENSEARCH_PORT: "9200"
+      RAG_SERVICE_URL: "http://cybersentinel-rag:8000"
+      POLL_INTERVAL_SECONDS: "300"
+      SETUP_ON_STARTUP: "true"
+    networks:
+      - cybersentinel-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c 'import urllib.request; urllib.request.urlopen(\"http://localhost:8001/health\")' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 512M
+        reservations:
+          cpus: "0.5"
+          memory: 256M
+
+# ================================
+# Volumes
+# ================================
+volumes:
+  cybersentinel-kafka-data:
+    driver: local
+  cybersentinel-kafka-logs:
+    driver: local
+  cybersentinel-zookeeper-data:
+    driver: local
+  cybersentinel-zookeeper-logs:
+    driver: local
+  cybersentinel-db-data:
+    driver: local
+  cybersentinel-vault-data:
+    driver: local
+  cybersentinel-vault-logs:
+    driver: local
+
+# ================================
+# Network
+# ================================
+networks:
+  cybersentinel-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.25.0.0/16
