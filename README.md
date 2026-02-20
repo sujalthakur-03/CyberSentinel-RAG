@@ -70,11 +70,11 @@ The core query engine at `rag-service/`.
   - **Context deduplication** — suppresses redundant UBA blocks for aggregate queries; annotates logs with UBA risk scores for other intents
   - **Session context** for follow-up questions with drift detection
 
-- **`opensearch_client.py`** — OpenSearch client handling kNN vector search, keyword search with field boosting, and insight persistence with two-layer deduplication (hash-based + semantic similarity).
+- **`opensearch_client.py`** — OpenSearch client handling kNN vector search, keyword search with field boosting, and insight persistence with two-layer deduplication (hash-based + semantic similarity). Connection pool sized at 50 to support concurrent multi-worker searches.
 
 - **`embedding.py`** — Sentence-transformers `all-MiniLM-L6-v2` model for generating 384-dimensional embeddings.
 
-- **`llm_client.py`** — HTTP client for Ollama-hosted Vicuna-13B with a strict cybersecurity system prompt that enforces grounded answers.
+- **`llm_client.py`** — HTTP client for Ollama-hosted Vicuna-13B with a strict cybersecurity system prompt that enforces grounded answers. Uses a persistent httpx client with connection pooling (20 max connections, 10 keepalive) for efficient LLM communication.
 
 - **`session_manager.py`** — In-memory session context with configurable TTL, entity inheritance for follow-up questions, and automatic drift reset.
 
@@ -242,6 +242,13 @@ Health check endpoint.
 
 ## Infrastructure Optimizations
 
+### Concurrency & Performance
+- **Multi-worker Uvicorn (4 workers)** — RAG service runs 4 separate Python processes, eliminating GIL contention for T5 query rewriting and embedding inference under concurrent load
+- **httpx connection pooling** — Persistent HTTP client with 20 max connections and 10 keepalive connections for Ollama LLM calls, eliminating per-request TCP handshake overhead
+- **OpenSearch connection pool (50)** — Sized to support 4 workers × 4 parallel searches per query without connection starvation
+- **RAG container resources** — 4 CPU cores / 4 GB RAM to support multi-worker model loading
+
+### Storage & Efficiency
 - **Kafka lz4 compression** — 40-60% storage savings on log transport with negligible CPU overhead
 - **OpenSearch 2 GB heap** — Reduced GC pressure, leaves headroom for OS page cache
 - **Index Lifecycle Management** — Automatic cleanup of old logs (90 days) and anomaly results (7 days)
@@ -257,7 +264,7 @@ Health check endpoint.
 - **Search Engine**: OpenSearch with Anomaly Detection and Alerting plugins
 - **Message Queue**: Apache Kafka with Zookeeper
 - **Secrets**: HashiCorp Vault
-- **Framework**: FastAPI + Uvicorn
+- **Framework**: FastAPI + Uvicorn (4 workers)
 - **Containerization**: Docker Compose
 
 ## Project Structure
