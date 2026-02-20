@@ -251,11 +251,11 @@ services:
     deploy:
       resources:
         limits:
+          cpus: "4"
+          memory: 4G
+        reservations:
           cpus: "2"
           memory: 2G
-        reservations:
-          cpus: "1"
-          memory: 1G
 
   # ================================
   # CyberSentinel UBA Bridge

@@ -17,6 +17,15 @@ import config
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Persistent HTTP client — reused across all LLM calls in this worker.
+# Avoids per-request TCP handshake overhead and enables HTTP keepalive.
+# ---------------------------------------------------------------------------
+_http_client = httpx.Client(
+    timeout=config.OLLAMA_TIMEOUT,
+    limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+)
+
+# ---------------------------------------------------------------------------
 # System instruction — the LLM's operating mandate
 # ---------------------------------------------------------------------------
 # This is intentionally stern.  Vicuna-13B is instruction-tuned but will
@@ -99,9 +108,8 @@ def generate(context: str, question: str) -> str:
     )
 
     try:
-        with httpx.Client(timeout=config.OLLAMA_TIMEOUT) as client:
-            resp = client.post(url, json=payload)
-            resp.raise_for_status()
+        resp = _http_client.post(url, json=payload)
+        resp.raise_for_status()
     except httpx.HTTPStatusError as exc:
         logger.error(
             "Ollama HTTP error: %s — %s",

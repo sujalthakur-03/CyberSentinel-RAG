@@ -38,6 +38,7 @@ def get_client() -> OpenSearch:
             use_ssl=False,
             verify_certs=False,
             timeout=30,
+            pool_maxsize=50,
         )
         logger.info(
             "Connected to OpenSearch at %s:%s",
