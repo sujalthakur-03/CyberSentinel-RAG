@@ -9,16 +9,15 @@ MITRE techniques, event counts, and related IPs.
 import logging
 from datetime import datetime, timezone, timedelta
 
-import requests
-
 import config
+from http_client import session as _session
 
 logger = logging.getLogger(__name__)
 
 
 def _opensearch_search(body: dict, index: str = config.LOG_INDEX) -> dict:
     """Execute a search against OpenSearch."""
-    resp = requests.post(
+    resp = _session.post(
         f"{config.OPENSEARCH_URL}/{index}/_search",
         json=body,
         headers={"Content-Type": "application/json"},

@@ -116,6 +116,26 @@ def query(req: QueryRequest):
     # Resolve session — generate a new one if caller didn't provide one
     session_id = req.session_id or str(uuid.uuid4())
 
+    # Identity questions — answer immediately without retrieval or LLM
+    _IDENTITY_PATTERNS = (
+        "who are you", "what are you", "what is your name",
+        "your name", "your identity", "introduce yourself",
+        "tell me about yourself",
+    )
+    question_lower = req.question.lower().strip().rstrip("?").strip()
+    if any(pat in question_lower for pat in _IDENTITY_PATTERNS):
+        return QueryResponse(
+            answer=(
+                "I am CyberSentinel AI, created by the CyberSentinel Developer Team. "
+                "Feel free to ask any question about the SIEM logs."
+            ),
+            strategy="identity",
+            sources_count=0,
+            context_preview="",
+            session_id=session_id,
+            time_range_used_hours=0,
+        )
+
     # Step 1–4: retrieval with time filtering, aggregation, session awareness
     result = retriever.retrieve(req.question, session_id=session_id)
 

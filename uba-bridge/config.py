@@ -9,7 +9,11 @@ import os
 # ---------------------------------------------------------------------------
 OPENSEARCH_HOST = os.getenv("OPENSEARCH_HOST", "cybersentinel-database")
 OPENSEARCH_PORT = int(os.getenv("OPENSEARCH_PORT", "9200"))
-OPENSEARCH_URL = f"http://{OPENSEARCH_HOST}:{OPENSEARCH_PORT}"
+OPENSEARCH_USE_SSL = os.getenv("OPENSEARCH_USE_SSL", "false").lower() == "true"
+OPENSEARCH_USERNAME = os.getenv("OPENSEARCH_USERNAME", "admin")
+OPENSEARCH_PASSWORD = os.getenv("OPENSEARCH_PASSWORD", "CyberSentinel@2026!")
+_scheme = "https" if OPENSEARCH_USE_SSL else "http"
+OPENSEARCH_URL = f"{_scheme}://{OPENSEARCH_HOST}:{OPENSEARCH_PORT}"
 
 # ---------------------------------------------------------------------------
 # RAG Service

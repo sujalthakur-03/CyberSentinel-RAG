@@ -9,6 +9,7 @@ import time
 import requests
 
 import config
+from http_client import session as _session
 from setup_detectors import setup_detectors
 from setup_monitors import setup_monitors
 from setup_ilm import setup_ilm
@@ -20,7 +21,7 @@ def wait_for_opensearch(max_retries: int = 30, delay: int = 10) -> bool:
     """Wait for OpenSearch to be healthy before proceeding."""
     for attempt in range(1, max_retries + 1):
         try:
-            resp = requests.get(
+            resp = _session.get(
                 f"{config.OPENSEARCH_URL}/_cluster/health",
                 timeout=10,
             )

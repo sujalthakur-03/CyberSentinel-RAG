@@ -12,9 +12,8 @@ Monitors:
 import logging
 import time
 
-import requests
-
 import config
+from http_client import session as _session
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +25,7 @@ def _create_webhook_destination() -> str | None:
     """
     # Check for existing notification configs
     try:
-        resp = requests.get(
+        resp = _session.get(
             f"{config.OPENSEARCH_URL}/_plugins/_notifications/configs",
             params={"config_type": "webhook"},
             headers={"Content-Type": "application/json"},
@@ -59,7 +58,7 @@ def _create_webhook_destination() -> str | None:
             },
         },
     }
-    resp = requests.post(
+    resp = _session.post(
         f"{config.OPENSEARCH_URL}/_plugins/_notifications/configs/",
         json=body,
         headers={"Content-Type": "application/json"},
@@ -284,7 +283,7 @@ def get_existing_monitors() -> dict[str, str]:
         "query": {"match_all": {}},
         "size": 100,
     }
-    resp = requests.post(
+    resp = _session.post(
         f"{config.OPENSEARCH_URL}/_plugins/_alerting/monitors/_search",
         json=body,
         headers={"Content-Type": "application/json"},
@@ -343,7 +342,7 @@ def setup_monitors() -> dict[str, str]:
             triggers=[trigger],
         )
 
-        resp = requests.post(
+        resp = _session.post(
             f"{config.OPENSEARCH_URL}/_plugins/_alerting/monitors",
             json=monitor_body,
             headers={"Content-Type": "application/json"},

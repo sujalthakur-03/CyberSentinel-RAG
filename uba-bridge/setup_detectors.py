@@ -12,9 +12,8 @@ Detectors:
 import logging
 import time
 
-import requests
-
 import config
+from http_client import session as _session
 
 logger = logging.getLogger(__name__)
 
@@ -171,7 +170,7 @@ def get_existing_detectors() -> dict[str, str]:
         "_source": ["name"],
         "size": 100,
     }
-    resp = requests.post(
+    resp = _session.post(
         f"{config.OPENSEARCH_URL}/_plugins/_anomaly_detection/detectors/_search",
         json=body,
         headers={"Content-Type": "application/json"},
@@ -191,7 +190,7 @@ def create_detector(det: dict) -> str | None:
     Create a single anomaly detector. Returns the detector ID on success.
     """
     body = _build_detector_body(det)
-    resp = requests.post(
+    resp = _session.post(
         f"{config.OPENSEARCH_URL}/_plugins/_anomaly_detection/detectors",
         json=body,
         headers={"Content-Type": "application/json"},
@@ -211,7 +210,7 @@ def create_detector(det: dict) -> str | None:
 
 def start_detector(detector_id: str, name: str) -> bool:
     """Start an anomaly detector by ID."""
-    resp = requests.post(
+    resp = _session.post(
         f"{config.OPENSEARCH_URL}/_plugins/_anomaly_detection/detectors/{detector_id}/_start",
         headers={"Content-Type": "application/json"},
         timeout=30,
@@ -229,7 +228,7 @@ def start_detector(detector_id: str, name: str) -> bool:
 
 def _stop_detector(detector_id: str, name: str) -> bool:
     """Stop an anomaly detector by ID."""
-    resp = requests.post(
+    resp = _session.post(
         f"{config.OPENSEARCH_URL}/_plugins/_anomaly_detection/detectors/{detector_id}/_stop",
         headers={"Content-Type": "application/json"},
         timeout=30,
@@ -252,7 +251,7 @@ def update_detector_if_changed(detector_id: str, det: dict) -> bool:
     Returns True if an update was performed.
     """
     try:
-        resp = requests.get(
+        resp = _session.get(
             f"{config.OPENSEARCH_URL}/_plugins/_anomaly_detection/detectors/{detector_id}",
             timeout=10,
         )
@@ -282,7 +281,7 @@ def update_detector_if_changed(detector_id: str, det: dict) -> bool:
     _stop_detector(detector_id, det["name"])
     time.sleep(1)
 
-    resp = requests.put(
+    resp = _session.put(
         f"{config.OPENSEARCH_URL}/_plugins/_anomaly_detection/detectors/{detector_id}",
         json=desired_body,
         headers={"Content-Type": "application/json"},

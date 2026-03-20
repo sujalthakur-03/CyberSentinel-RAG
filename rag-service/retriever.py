@@ -67,6 +67,7 @@ Retrieval flow diagram:
 """
 
 import logging
+import re
 import time as _time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, Future
@@ -101,6 +102,87 @@ _STOP_WORDS = frozenset({
 })
 
 
+
+# ---------------------------------------------------------------------------
+# Domain-specific query expansion
+# ---------------------------------------------------------------------------
+# Maps common analyst phrases to the actual field values / terms used in
+# Wazuh / OpenSearch logs.  When an analyst asks about "File Integrity
+# Monitoring", the search also includes "syscheck" which is the Wazuh
+# field family for FIM events.  This bridges the terminology gap between
+# analyst language and log schema.
+_DOMAIN_SYNONYMS: list[tuple[re.Pattern, list[str]]] = [
+    (re.compile(r"\bfile\s+integrity\s+monitoring\b|\bFIM\b", re.I),
+     ["syscheck", "integrity", "file"]),
+    (re.compile(r"\bbrute\s+force\b", re.I),
+     ["authentication_failed", "Login failed", "T1110"]),
+    (re.compile(r"\blateral\s+movement\b", re.I),
+     ["T1021", "T1076", "remote", "RDP", "ssh"]),
+    (re.compile(r"\bdata\s+exfiltration\b|\bdata\s+leak\b", re.I),
+     ["T1041", "outbound", "upload", "exfiltration"]),
+    (re.compile(r"\bprivilege\s+escalation\b", re.I),
+     ["T1548", "elevated", "privilege", "sudo"]),
+    (re.compile(r"\bmalware\b|\bransomware\b", re.I),
+     ["T1059", "T1105", "executable", "malicious", "script"]),
+    (re.compile(r"\bVPN\b", re.I),
+     ["ssl-login-fail", "xauthuser", "SSL VPN"]),
+    (re.compile(r"\bfirewall\b", re.I),
+     ["Fortigate", "block", "deny", "pass", "policy"]),
+]
+
+
+def _expand_domain_terms(query: str, terms: list[str]) -> list[str]:
+    """Add domain-specific synonyms when analyst phrases match."""
+    expanded = list(terms)
+    seen = {t.lower() for t in terms}
+    for pattern, synonyms in _DOMAIN_SYNONYMS:
+        if pattern.search(query):
+            for syn in synonyms:
+                if syn.lower() not in seen:
+                    expanded.append(syn)
+                    seen.add(syn.lower())
+    return expanded
+
+
+# ---------------------------------------------------------------------------
+# Aggregation field resolution — maps query patterns to OpenSearch fields
+# ---------------------------------------------------------------------------
+_AGG_FIELD_PATTERNS: list[tuple[re.Pattern, str, str | None]] = [
+    (re.compile(r"\b(?:agent|host|server|endpoint)\b", re.I),
+     "agent.name", "rule.description"),
+    (re.compile(r"\b(?:source\s*ip|srcip|src\s+address)\b", re.I),
+     "data.srcip", "rule.description"),
+    (re.compile(r"\b(?:destination\s*ip|dstip|dst\s+address|dest\s*ip)\b", re.I),
+     "data.dstip", "rule.description"),
+    (re.compile(r"\b(?:user|username|account)\b", re.I),
+     "data.srcuser", "rule.description"),
+    (re.compile(r"\b(?:rule|alert|detection)\b", re.I),
+     "rule.id", None),
+    (re.compile(r"\b(?:action|block|deny|allow)\b", re.I),
+     "data.action", "agent.name"),
+    (re.compile(r"\b(?:country|geographic|geo)\b", re.I),
+     "data.srccountry", "data.srcip"),
+    (re.compile(r"\b(?:mitre|technique|tactic)\b", re.I),
+     "rule.mitre.technique", None),
+    (re.compile(r"\b(?:device|firewall|fortigate)\b", re.I),
+     "data.devname", "data.action"),
+]
+
+
+def _resolve_agg_fields(query: str) -> tuple[str, str | None]:
+    """Match query against patterns and return (agg_field, sub_agg_field)."""
+    for pattern, field, sub_field in _AGG_FIELD_PATTERNS:
+        if pattern.search(query):
+            return field, sub_field
+    return "agent.name", "rule.description"
+
+
+def _extract_top_n(query: str) -> int | None:
+    """Extract N from 'top N' / 'top-N' patterns in the query."""
+    m = re.search(r"\btop[\s-]?(\d+)\b", query, re.I)
+    return int(m.group(1)) if m else None
+
+
 def _extract_query_terms(query: str) -> list[str]:
     """
     Extract meaningful search terms from a free-text query when no
@@ -110,7 +192,6 @@ def _extract_query_terms(query: str) -> list[str]:
     likely to match log field values (rule descriptions, actions,
     device names, event types, etc.).
     """
-    import re
     words = re.findall(r"[a-zA-Z0-9._@:/-]+", query)
     terms = [w for w in words if w.lower() not in _STOP_WORDS and len(w) >= 2]
     return terms
@@ -435,6 +516,7 @@ def _build_context(
     uba_hits: list[dict],
     insight_hits: list[dict],
     intent: str = "general",
+    agg_result: dict | None = None,
 ) -> str:
     """
     Assemble the final context string with risk-aware ordering and
@@ -446,6 +528,9 @@ def _build_context(
       behavioral          |     2      |    4     |    2
       entity_investigation|     4      |    2     |    1
       general             |     4      |    2     |    1
+
+    When *agg_result* is provided (aggregate intent), the aggregation
+    section is placed first (highest LLM attention) before UBA and logs.
 
     For aggregate intent, UBA blocks whose entity already appears in
     log blocks are suppressed to avoid duplication.  For other intents,
@@ -461,6 +546,10 @@ def _build_context(
     budget = _BUDGETS.get(intent, _BUDGETS["general"])
 
     sections: list[str] = []
+
+    # --- 0. Aggregation results (highest priority for aggregate intent) ---
+    if agg_result and agg_result.get("buckets"):
+        sections.append(_format_aggregation_context(agg_result))
 
     # --- 1. High-risk UBA (top of context = highest LLM attention) --------
     high_uba, low_uba = _aggregate_uba(uba_hits)
@@ -601,6 +690,81 @@ def _timed_insight_search(query_vec: list[float]) -> list[dict]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# AGGREGATION CONTEXT FORMATTING
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _format_aggregation_context(agg_result: dict) -> str:
+    """
+    Format aggregation results into clear text for LLM consumption.
+
+    Produces a ranked breakdown with counts and percentages, plus
+    sub-aggregation details when available.
+    """
+    field = agg_result["agg_field"]
+    # Strip .keyword suffix for display
+    display_field = field.replace(".keyword", "")
+    total = agg_result["total_matching"]
+    buckets = agg_result["buckets"]
+
+    lines = [
+        f"=== Aggregation Results (field: {display_field}) ===",
+        f"TOTAL matching documents: {total:,}",
+        f"Breakdown by {display_field} (ranked by count, descending):",
+        "",
+    ]
+
+    for i, bucket in enumerate(buckets, 1):
+        key = bucket["key"]
+        count = bucket["doc_count"]
+        pct = (count / total * 100) if total > 0 else 0
+        lines.append(f"  {i}. {key}: {count:,} events ({pct:.1f}%)")
+
+        sub_buckets = bucket.get("sub_buckets", [])
+        for sb in sub_buckets:
+            lines.append(f"      - {sb['key']}: {sb['doc_count']:,}")
+
+    # Append sample docs for citation
+    sample_docs = agg_result.get("sample_docs", [])
+    if sample_docs:
+        lines.append("")
+        lines.append(f"Sample log entries ({len(sample_docs)} most recent):")
+        for doc in sample_docs[:5]:
+            ts = doc.get("@timestamp") or doc.get("timestamp", "?")
+            agent = _get_nested(doc, "agent.name") or "?"
+            rule = _get_nested(doc, "rule.description") or _get_nested(doc, "data.action") or "?"
+            src = _get_nested(doc, "data.srcip") or _get_nested(doc, "agent.ip") or "?"
+            lines.append(f"  [{ts}] agent={agent} rule={rule} src={src}")
+
+    return "\n".join(lines)
+
+
+def _timed_aggregation_search(
+    terms: list[str],
+    agg_field: str,
+    sub_agg_field: str | None,
+    lookback_hours: int,
+    max_buckets: int = config.AGG_MAX_BUCKETS,
+    sample_size: int = config.AGG_SAMPLE_SIZE,
+) -> dict:
+    """Aggregation search wrapper that logs wall-clock duration."""
+    t0 = _time.monotonic()
+    result = opensearch_client.aggregation_search(
+        terms,
+        agg_field=agg_field,
+        sub_agg_field=sub_agg_field,
+        lookback_hours=lookback_hours,
+        max_buckets=max_buckets,
+        sample_size=sample_size,
+    )
+    elapsed = (_time.monotonic() - t0) * 1000
+    logger.info(
+        "aggregation_search field=%s returned %d buckets in %.1f ms",
+        agg_field, len(result.get("buckets", [])), elapsed,
+    )
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # MAIN RETRIEVAL PIPELINE
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -691,15 +855,32 @@ def retrieve(query: str, session_id: Optional[str] = None) -> RetrievalResult:
     if not search_terms:
         search_terms = _extract_query_terms(query)
 
+    # Expand with domain-specific synonyms (e.g. "FIM" → "syscheck")
+    search_terms = _expand_domain_terms(query, search_terms)
+
     # ------------------------------------------------------------------
     # Intent-aware retrieval setup
     # ------------------------------------------------------------------
     intent = entities.query_intent
     skip_vector_search = (intent == "aggregate")
 
-    # For aggregate intent, request TOP_K_LOGS * 4 (100 hits) for
-    # enough data to answer ranking/counting questions.
-    log_size = config.TOP_K_LOGS * 4 if intent == "aggregate" else config.TOP_K_LOGS
+    # For aggregate intent, use AGG_SAMPLE_SIZE for keyword (sample docs
+    # for citation); the real counts come from the aggregation query.
+    log_size = config.AGG_SAMPLE_SIZE if intent == "aggregate" else config.TOP_K_LOGS
+
+    # Resolve aggregation fields for aggregate intent
+    agg_field: str | None = None
+    sub_agg_field: str | None = None
+    agg_max_buckets = config.AGG_MAX_BUCKETS
+    if intent == "aggregate":
+        agg_field, sub_agg_field = _resolve_agg_fields(query)
+        top_n = _extract_top_n(query)
+        if top_n:
+            agg_max_buckets = top_n
+        logger.info(
+            "Aggregate intent — agg_field=%s sub=%s max_buckets=%d",
+            agg_field, sub_agg_field, agg_max_buckets,
+        )
 
     # Only compute embedding when vector search will actually run
     query_vec: list[float] | None = None
@@ -718,12 +899,22 @@ def retrieve(query: str, session_id: Optional[str] = None) -> RetrievalResult:
     vec_future: Future | None = None
     ins_future: Future | None = None
     uba_entity_future: Future | None = None
+    agg_future: Future | None = None
+    agg_result: dict | None = None
 
-    with ThreadPoolExecutor(max_workers=4, thread_name_prefix="retrieval") as pool:
+    with ThreadPoolExecutor(max_workers=5, thread_name_prefix="retrieval") as pool:
         # Keyword search on logs-* (only when search terms exist)
         if search_terms:
             kw_future = pool.submit(
                 _timed_keyword_search, search_terms, log_hours, log_size,
+            )
+
+        # Aggregation search (parallel with keyword) for aggregate intent
+        if intent == "aggregate" and search_terms and agg_field:
+            agg_future = pool.submit(
+                _timed_aggregation_search,
+                search_terms, agg_field, sub_agg_field,
+                log_hours, agg_max_buckets, config.AGG_SAMPLE_SIZE,
             )
 
         # Vector search on UBA — skip for aggregate intent
@@ -773,6 +964,13 @@ def retrieve(query: str, session_id: Optional[str] = None) -> RetrievalResult:
             except Exception:
                 pass
 
+        if agg_future is not None:
+            try:
+                agg_result = agg_future.result()
+                strategy = "aggregation"
+            except Exception:
+                logger.exception("Aggregation search failed")
+
     # --- Fallback: broad keyword search bounded by time -------------------
     # Runs only when the parallel phase produced nothing.  This path is
     # NOT parallelised because it is mutually exclusive with the primary
@@ -782,7 +980,9 @@ def retrieve(query: str, session_id: Optional[str] = None) -> RetrievalResult:
         strategy = "keyword_fallback"
 
     # --- Assemble risk-prioritised context --------------------------------
-    context = _build_context(log_hits, uba_hits, insight_hits, intent=intent)
+    context = _build_context(
+        log_hits, uba_hits, insight_hits, intent=intent, agg_result=agg_result,
+    )
 
     if inherited:
         strategy = "session_followup"

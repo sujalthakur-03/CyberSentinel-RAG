@@ -11,7 +11,9 @@ import os
 # ---------------------------------------------------------------------------
 OPENSEARCH_HOST = os.getenv("OPENSEARCH_HOST", "cybersentinel-database")
 OPENSEARCH_PORT = int(os.getenv("OPENSEARCH_PORT", "9200"))
-OPENSEARCH_SCHEME = os.getenv("OPENSEARCH_SCHEME", "http")
+OPENSEARCH_USE_SSL = os.getenv("OPENSEARCH_USE_SSL", "false").lower() == "true"
+OPENSEARCH_USERNAME = os.getenv("OPENSEARCH_USERNAME", "admin")
+OPENSEARCH_PASSWORD = os.getenv("OPENSEARCH_PASSWORD", "CyberSentinel@2026!")
 
 # Index patterns
 LOG_INDEX_PATTERN = os.getenv("LOG_INDEX_PATTERN", "logs-*")
@@ -32,7 +34,7 @@ VECTOR_DIMENSION = int(os.getenv("VECTOR_DIMENSION", "384"))
 OLLAMA_BASE_URL = os.getenv(
     "OLLAMA_BASE_URL", "http://164.52.194.98:11434"
 )
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "vicuna:13b")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:14b")
 OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "120"))
 
 # ---------------------------------------------------------------------------
@@ -64,6 +66,10 @@ MAX_AGGREGATED_BLOCKS = int(os.getenv("MAX_AGGREGATED_BLOCKS", "8"))
 #     queries OpenSearch directly — the RAG service is an analyst aid, not
 #     a forensic export tool.
 MAX_LOG_HITS_PER_QUERY = int(os.getenv("MAX_LOG_HITS_PER_QUERY", "500"))
+
+# Aggregation queries — used for aggregate-intent questions (counts, rankings)
+AGG_MAX_BUCKETS = int(os.getenv("AGG_MAX_BUCKETS", "20"))
+AGG_SAMPLE_SIZE = int(os.getenv("AGG_SAMPLE_SIZE", "10"))
 
 # ---------------------------------------------------------------------------
 # Time-range safety

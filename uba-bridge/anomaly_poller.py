@@ -11,6 +11,7 @@ from datetime import datetime, timezone, timedelta
 import requests
 
 import config
+from http_client import session as _session
 from enrichment import enrich_entity, enrich_entities_batch
 from summary_builder import (
     build_anomaly_summary,
@@ -98,7 +99,7 @@ def poll_anomaly_results():
     }
 
     try:
-        resp = requests.post(
+        resp = _session.post(
             f"{config.OPENSEARCH_URL}/{config.ANOMALY_RESULTS_INDEX}/_search",
             json=body,
             headers={"Content-Type": "application/json"},
@@ -224,7 +225,7 @@ def _get_detector_name(detector_id: str) -> str:
         return _detector_name_cache[detector_id]
 
     try:
-        resp = requests.get(
+        resp = _session.get(
             f"{config.OPENSEARCH_URL}/_plugins/_anomaly_detection/detectors/{detector_id}",
             timeout=10,
         )

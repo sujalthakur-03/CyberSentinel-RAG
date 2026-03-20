@@ -7,9 +7,8 @@ indices left behind by index rollovers or failed ingestion.
 
 import logging
 
-import requests
-
 import config
+from http_client import session as _session
 
 logger = logging.getLogger(__name__)
 
@@ -92,13 +91,13 @@ def _put_policy(policy_id: str, body: dict) -> bool:
     """Create or update an ISM policy. Returns True on success."""
     url = f"{config.OPENSEARCH_URL}/_plugins/_ism/policies/{policy_id}"
     # Check if policy already exists
-    resp = requests.get(url, timeout=10)
+    resp = _session.get(url, timeout=10)
     if resp.status_code == 200:
         # Update: need to include seq_no and primary_term
         existing = resp.json()
         seq_no = existing.get("_seq_no", 0)
         primary_term = existing.get("_primary_term", 1)
-        resp = requests.put(
+        resp = _session.put(
             f"{url}?if_seq_no={seq_no}&if_primary_term={primary_term}",
             json=body,
             headers={"Content-Type": "application/json"},
@@ -106,7 +105,7 @@ def _put_policy(policy_id: str, body: dict) -> bool:
         )
     else:
         # Create
-        resp = requests.put(
+        resp = _session.put(
             url,
             json=body,
             headers={"Content-Type": "application/json"},
@@ -131,7 +130,7 @@ def cleanup_empty_indices():
     waste cluster resources.
     """
     try:
-        resp = requests.get(
+        resp = _session.get(
             f"{config.OPENSEARCH_URL}/_cat/indices/logs-*",
             params={"format": "json", "h": "index,docs.count,status"},
             timeout=30,
@@ -149,7 +148,7 @@ def cleanup_empty_indices():
 
         if doc_count == 0:
             try:
-                del_resp = requests.delete(
+                del_resp = _session.delete(
                     f"{config.OPENSEARCH_URL}/{index_name}",
                     timeout=30,
                 )

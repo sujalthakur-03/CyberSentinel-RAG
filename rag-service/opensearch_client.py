@@ -26,24 +26,27 @@ _client: OpenSearch | None = None
 # ---------------------------------------------------------------------------
 
 def get_client() -> OpenSearch:
-    """Return a reusable OpenSearch client (no auth — security plugin disabled)."""
+    """Return a reusable OpenSearch client with optional SSL + basic auth."""
     global _client
     if _client is None:
-        _client = OpenSearch(
-            hosts=[{
-                "host": config.OPENSEARCH_HOST,
-                "port": config.OPENSEARCH_PORT,
-            }],
-            http_compress=True,
-            use_ssl=False,
-            verify_certs=False,
-            timeout=30,
-            pool_maxsize=50,
-        )
+        kwargs = {
+            "hosts": [{"host": config.OPENSEARCH_HOST, "port": config.OPENSEARCH_PORT}],
+            "http_compress": True,
+            "use_ssl": config.OPENSEARCH_USE_SSL,
+            "verify_certs": False,
+            "ssl_show_warn": False,
+            "timeout": 30,
+            "pool_maxsize": 50,
+        }
+        if config.OPENSEARCH_USERNAME and config.OPENSEARCH_PASSWORD:
+            kwargs["http_auth"] = (config.OPENSEARCH_USERNAME, config.OPENSEARCH_PASSWORD)
+        _client = OpenSearch(**kwargs)
         logger.info(
-            "Connected to OpenSearch at %s:%s",
+            "Connected to OpenSearch at %s:%s (ssl=%s, auth=%s)",
             config.OPENSEARCH_HOST,
             config.OPENSEARCH_PORT,
+            config.OPENSEARCH_USE_SSL,
+            bool(config.OPENSEARCH_USERNAME),
         )
     return _client
 
@@ -174,6 +177,44 @@ def _time_range_filter(field: str, hours: Optional[int] = None, days: Optional[i
     return {"range": {field: {"gte": gte.isoformat(), "lte": "now"}}}
 
 
+# Comprehensive field list derived from the actual Wazuh/Fortigate/Windows
+# log schema.  Covers IPs, users, hosts, messages, rules, actions,
+# file integrity, Windows Sysmon, and raw logs — everything a SOC analyst
+# might ask about.  Bounded to ~30 fields to stay under OpenSearch's
+# 1024-clause limit even with multiple search terms.
+# Shared by keyword_search() and aggregation_search().
+_SEARCH_FIELDS = [
+    # Rule / alert metadata
+    "rule.description", "rule.groups", "rule.id",
+    "rule.mitre.technique", "rule.mitre.tactic",
+    # Network / IPs (ip-typed fields need lenient)
+    "agent.ip", "network.srcIp", "network.destIp",
+    "data.srcip", "data.dstip", "data.remip", "location",
+    # GeoIP / country
+    "data.srccountry", "data.dstcountry",
+    # Host / agent / device
+    "agent.name", "data.devname", "data.hostname", "data.dst_host",
+    # Users
+    "data.srcuser", "data.dstuser", "data.xauthuser",
+    "data.win.eventdata.user", "syscheck.audit.user.name",
+    # Actions / events / messages
+    "data.action", "data.msg", "data.logdesc",
+    "data.subtype", "data.type", "data.status", "data.reason",
+    "data.service", "data.group",
+    # Application / policy
+    "data.app", "data.appcat", "data.policyid",
+    # File / URL / process
+    "data.filename", "data.url",
+    "data.win.eventdata.commandLine", "data.win.eventdata.image",
+    "data.win.eventdata.parentImage",
+    "data.win.system.message",
+    # File integrity
+    "syscheck.path", "syscheck.event",
+    # Raw log (catches anything not in structured fields)
+    "raw_log.message", "raw_log.rule_description",
+]
+
+
 def keyword_search(
     terms: list[str],
     index: str = config.LOG_INDEX_PATTERN,
@@ -201,42 +242,6 @@ def keyword_search(
     # Hard ceiling — never let a single query pull more than this
     effective_size = min(size, config.MAX_LOG_HITS_PER_QUERY)
     effective_hours = lookback_hours or config.DEFAULT_LOG_TIME_RANGE_HOURS
-
-    # Comprehensive field list derived from the actual Wazuh/Fortigate/Windows
-    # log schema.  Covers IPs, users, hosts, messages, rules, actions,
-    # file integrity, Windows Sysmon, and raw logs — everything a SOC analyst
-    # might ask about.  Bounded to ~30 fields to stay under OpenSearch's
-    # 1024-clause limit even with multiple search terms.
-    _SEARCH_FIELDS = [
-        # Rule / alert metadata
-        "rule.description", "rule.groups", "rule.id",
-        "rule.mitre.technique", "rule.mitre.tactic",
-        # Network / IPs (ip-typed fields need lenient)
-        "agent.ip", "network.srcIp", "network.destIp",
-        "data.srcip", "data.dstip", "data.remip", "location",
-        # GeoIP / country
-        "data.srccountry", "data.dstcountry",
-        # Host / agent / device
-        "agent.name", "data.devname", "data.hostname", "data.dst_host",
-        # Users
-        "data.srcuser", "data.dstuser", "data.xauthuser",
-        "data.win.eventdata.user", "syscheck.audit.user.name",
-        # Actions / events / messages
-        "data.action", "data.msg", "data.logdesc",
-        "data.subtype", "data.type", "data.status", "data.reason",
-        "data.service", "data.group",
-        # Application / policy
-        "data.app", "data.appcat", "data.policyid",
-        # File / URL / process
-        "data.filename", "data.url",
-        "data.win.eventdata.commandLine", "data.win.eventdata.image",
-        "data.win.eventdata.parentImage",
-        "data.win.system.message",
-        # File integrity
-        "syscheck.path", "syscheck.event",
-        # Raw log (catches anything not in structured fields)
-        "raw_log.message", "raw_log.rule_description",
-    ]
 
     should_clauses = []
     for term in terms:
@@ -271,6 +276,155 @@ def keyword_search(
 
     resp = client.search(index=index, body=body)
     return [hit["_source"] for hit in resp["hits"]["hits"]]
+
+
+def aggregation_search(
+    terms: list[str],
+    agg_field: str,
+    sub_agg_field: Optional[str] = None,
+    index: str = config.LOG_INDEX_PATTERN,
+    lookback_hours: Optional[int] = None,
+    max_buckets: int = config.AGG_MAX_BUCKETS,
+    sample_size: int = config.AGG_SAMPLE_SIZE,
+) -> dict:
+    """
+    Terms aggregation across *index* with optional sub-aggregation.
+
+    Computes exact counts server-side across ALL matching documents rather
+    than counting a limited result set.  Used for aggregate-intent queries
+    like "which agent has the most login failures?".
+
+    Returns::
+
+        {
+            "total_matching": int,
+            "buckets": [{"key": str, "doc_count": int, "sub_buckets": [...]}],
+            "sample_docs": [dict, ...],
+            "agg_field": str,
+        }
+
+    If the primary *agg_field* returns zero buckets (common when the field is
+    mapped as ``text`` rather than ``keyword``), a retry is made with the
+    ``.keyword`` sub-field automatically.
+    """
+    client = get_client()
+    effective_hours = lookback_hours or config.DEFAULT_LOG_TIME_RANGE_HOURS
+
+    should_clauses = []
+    for term in terms:
+        should_clauses.append({
+            "multi_match": {
+                "query": term,
+                "fields": _SEARCH_FIELDS,
+                "type": "phrase",
+                "lenient": True,
+            }
+        })
+
+    query_block = {
+        "bool": {
+            "should": should_clauses,
+            "minimum_should_match": 1,
+            "filter": [_time_range_filter("@timestamp", hours=effective_hours)],
+        }
+    }
+
+    def _run_agg(field: str, sub_field: Optional[str] = None) -> dict:
+        aggs = {
+            "primary": {
+                "terms": {
+                    "field": field,
+                    "size": max_buckets,
+                    "order": {"_count": "desc"},
+                },
+            }
+        }
+        if sub_field:
+            aggs["primary"]["aggs"] = {
+                "sub": {
+                    "terms": {
+                        "field": sub_field,
+                        "size": 5,
+                        "order": {"_count": "desc"},
+                    }
+                }
+            }
+
+        body = {
+            "size": sample_size,
+            "query": query_block,
+            "aggs": aggs,
+            "sort": [{"@timestamp": {"order": "desc", "unmapped_type": "date"}}],
+        }
+        return client.search(index=index, body=body)
+
+    # Build candidate list of (primary_field, sub_field) combinations.
+    # Text-typed fields lack doc_values for terms aggs — try .keyword variants.
+    def _keyword_variant(f: Optional[str]) -> Optional[str]:
+        return f + ".keyword" if f and not f.endswith(".keyword") else None
+
+    candidates = [
+        (agg_field, sub_agg_field),
+        (agg_field, _keyword_variant(sub_agg_field)),
+        (_keyword_variant(agg_field), sub_agg_field),
+        (_keyword_variant(agg_field), _keyword_variant(sub_agg_field)),
+    ]
+    # Deduplicate while preserving order
+    seen: set[tuple] = set()
+    unique_candidates = []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            unique_candidates.append(c)
+
+    resp = None
+    buckets_raw: list = []
+    used_field = agg_field
+
+    for pf, sf in unique_candidates:
+        try:
+            resp = _run_agg(pf, sf)
+            buckets_raw = resp.get("aggregations", {}).get("primary", {}).get("buckets", [])
+            if buckets_raw:
+                used_field = pf
+                break
+            # Got a valid response but no buckets — keep trying
+            used_field = pf
+        except Exception as exc:
+            logger.debug("Agg attempt field=%s sub=%s failed: %s", pf, sf, exc)
+            continue
+
+    if resp is None:
+        # All candidates failed — raise so caller knows
+        raise RuntimeError(
+            f"All aggregation field combinations failed for {agg_field}"
+        )
+
+    total = resp["hits"]["total"]
+    total_matching = total["value"] if isinstance(total, dict) else total
+
+    buckets = []
+    for b in buckets_raw:
+        entry = {"key": b["key"], "doc_count": b["doc_count"]}
+        if "sub" in b:
+            entry["sub_buckets"] = [
+                {"key": sb["key"], "doc_count": sb["doc_count"]}
+                for sb in b["sub"]["buckets"]
+            ]
+        buckets.append(entry)
+
+    sample_docs = [hit["_source"] for hit in resp["hits"]["hits"]]
+
+    logger.info(
+        "aggregation_search field=%s buckets=%d total=%d samples=%d",
+        used_field, len(buckets), total_matching, len(sample_docs),
+    )
+    return {
+        "total_matching": total_matching,
+        "buckets": buckets,
+        "sample_docs": sample_docs,
+        "agg_field": used_field,
+    }
 
 
 def uba_entity_search(
